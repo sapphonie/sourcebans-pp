@@ -363,6 +363,8 @@ public bool OnClientPreConnectEx(const char[] name, char password[255], const ch
     // cant use name since some plugins will alter clients' names on connect
     strcopy(latestIP,       sizeof(latestIP),       ip);
     strcopy(latestSteamID,  sizeof(latestSteamID),  steamID);
+
+	return true;
 }
 
 // Fired after client is allowed thru connect ext
@@ -409,11 +411,13 @@ public void Event_PlayerConnect(Handle event, const char[] name, bool dontBroadc
     )
     {
         strcopy(g_sSteamIDs[client], sizeof(latestSteamID), latestSteamID);
+		LogMessage("trying to verify %s thru connect ext (attempt 1)", g_sSteamIDs[client]);
         // LogMessage("\n\nplayer_connect steamid = %s\n", SteamAuthFor[cl]);
     }
     // this should LITERALLY NEVER HAPPEN
     else
     {
+		//LogMessage("FAILED verifying connect ext, possible race condition!!", latestSteamID);
 		// Explode
     }
 }
@@ -433,11 +437,14 @@ public void OnClientConnected(int client)
 
 	if (g_sSteamIDs[client][0] == 0x0)
 	{
+		LogMessage("g_sSteamIDs[client][0] == 0x0, trying backup methods of verifying steamid");
+
 		// verified by connect extension
 		GetClientAuthId(client, AuthId_Steam2, auth, sizeof(auth), .validate=false);
 		if (StrEqual(sIP, latestIP) && StrEqual(latestSteamID, auth))
 		{
 			FormatEx(g_sSteamIDs[client], sizeof(g_sSteamIDs[]), "%s", auth);
+			LogMessage("verified %s thru connect ext (attempt 2)", g_sSteamIDs[client]);
 		}
 		// not verified by connect extension
 		else
@@ -447,12 +454,15 @@ public void OnClientConnected(int client)
 			if (Authed)
 			{
 				FormatEx(g_sSteamIDs[client], sizeof(g_sSteamIDs[]), "%s", auth);
+				LogMessage("verified %s thru steam, failed connect ext race condition!! (attempt 1)", g_sSteamIDs[client]);
 			}
 			// not verified by either - just tank it, whatever - Connect ext really needs a forward for this
 			else
 			{
 				GetClientAuthId(client, AuthId_Steam2, auth, sizeof(auth), .validate=false);
 				FormatEx(g_sSteamIDs[client], sizeof(g_sSteamIDs[]), "%s", auth);
+
+				LogMessage("did not verify thru steam, failed connect ext race condition!! using unverified steamid %s - YOLO!!", g_sSteamIDs[client]);
 			}
 		}
 	}
@@ -479,6 +489,8 @@ public void OnClientConnected(int client)
 
 public void OnClientAuthorized(int client, const char[] auth)
 {
+	LogMessage("g_sSteamIDs[client] = %s", g_sSteamIDs[client]);
+
 	if (PlayerStatus[client])
 		return;
 
