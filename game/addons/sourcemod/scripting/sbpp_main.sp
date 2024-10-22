@@ -32,7 +32,7 @@
 #undef REQUIRE_PLUGIN
 #include <adminmenu>
 #tryinclude <updater>
-
+#tryinclude <connect>
 #pragma newdecls required
 
 #define SB_VERSION "1.8.2"
@@ -183,6 +183,7 @@ public void OnPluginStart()
 	RegConsoleCmd("say_team", ChatHook);
 
 	HookEvent("player_changename", Event_OnPlayerName, EventHookMode_Post);
+    HookEvent("player_connect", Event_PlayerConnect);
 
 	sb_id = CreateConVar("sb_id", "-1", "Set to a value other than -1 to override the serverid in sourcebans.cfg", FCVAR_NONE, true, -1.0, false);
 	HookConVarChange(sb_id, sbid_reload);
@@ -333,6 +334,90 @@ public void OnClientDisconnect(int client)
 	g_iUserIDs[client] = -1;
 }
 
+
+/********** MISC CLIENT JOIN/LEAVE **********/
+
+// THESE ARE IN ORDER OF OPERATION
+// -> OnClientPreConnectEx is called
+//      ~0.25 ms pass
+// -> player_connect event is called
+//      ~50 ms pass
+// -> OnClientConnect is called
+//      then basically
+// -> OnClientConnected is called
+//      ~a few seconds pass
+// -> OnClientPutInServer is called
+
+// There is almost certainly no way to ever have a client ever trigger OCPCE -> EPC -> OCC out of order
+// But just in case we do a ton of checks
+
+static char latestIP        [16];
+static char latestSteamID   [MAX_AUTHID_LENGTH];
+
+// Fired before anything
+// CBaseServer::ConnectClient
+// which calls (CGameClient*)client->Connect
+// Does NOT fire on map change
+public bool OnClientPreConnectEx(const char[] name, char password[255], const char[] ip, const char[] steamID, char rejectReason[255])
+{
+    // cant use name since some plugins will alter clients' names on connect
+    strcopy(latestIP,       sizeof(latestIP),       ip);
+    strcopy(latestSteamID,  sizeof(latestSteamID),  steamID);
+}
+
+// Fired after client is allowed thru connect ext
+// CGameClient::Connect() ?
+// Does NOT fire on map change
+public void Event_PlayerConnect(Handle event, const char[] name, bool dontBroadcast)
+{
+    /*
+
+        player_connect
+
+        Note:   A new client connected
+        Name:   player_connect
+        Structure:
+        string  name        player name
+        byte    index       player slot (entity index-1)
+        short   userid      user ID on server (unique on server)
+        string  networkid   player network (i.e steam) id
+        string  address     ip:port
+        short   bot         is a bot
+
+    */
+    // it says index. it is the client slot. it is lying.
+    // actual client index = slot + 1
+    int client = ( GetEventInt(event, "index") + 1 );
+
+    // wipe the steamid for this client no matter what
+    g_sSteamIDs[client][0] = '\0';
+
+    // Don't run any more logic if we're a bot
+    bool bot = GetEventBool(event, "bot");
+    if (bot)
+    {
+        return;
+    }
+
+    char ipWithPort[24];
+    GetEventString(event, "address", ipWithPort, sizeof(ipWithPort), /* default value */ "junk");
+
+    if
+    (
+        // ip matches - latestIP has no port (for now)
+        StrContains(ipWithPort, latestIP) != -1
+    )
+    {
+        strcopy(g_sSteamIDs[client], sizeof(latestSteamID), latestSteamID);
+        // LogMessage("\n\nplayer_connect steamid = %s\n", SteamAuthFor[cl]);
+    }
+    // this should LITERALLY NEVER HAPPEN
+    else
+    {
+		// Explode
+    }
+}
+
 public bool OnClientConnect(int client, char[] rejectmsg, int maxlen)
 {
 	PlayerStatus[client] = false;
@@ -345,8 +430,33 @@ public void OnClientConnected(int client)
 	GetClientIP(client, sIP, sizeof(sIP));
 	FormatEx(g_sPlayerIP[client], sizeof(g_sPlayerIP[]), "%s", sIP);
 
-	GetClientAuthId(client, AuthId_Steam2, auth, sizeof(auth));
-	FormatEx(g_sSteamIDs[client], sizeof(g_sSteamIDs[]), "%s", auth);
+
+	if (g_sSteamIDs[client][0] == 0x0)
+	{
+		// verified by connect extension
+		GetClientAuthId(client, AuthId_Steam2, auth, sizeof(auth), .validate=false);
+		if (StrEqual(sIP, latestIP) && StrEqual(latestSteamID, auth))
+		{
+			FormatEx(g_sSteamIDs[client], sizeof(g_sSteamIDs[]), "%s", auth);
+		}
+		// not verified by connect extension
+		else
+		{
+			bool Authed = GetClientAuthId(client, AuthId_Steam2, auth, sizeof(auth), .validate=true);
+			// verified by steam itself
+			if (Authed)
+			{
+				FormatEx(g_sSteamIDs[client], sizeof(g_sSteamIDs[]), "%s", auth);
+			}
+			// not verified by either - just tank it, whatever - Connect ext really needs a forward for this
+			else
+			{
+				GetClientAuthId(client, AuthId_Steam2, auth, sizeof(auth), .validate=false);
+				FormatEx(g_sSteamIDs[client], sizeof(g_sSteamIDs[]), "%s", auth);
+			}
+		}
+	}
+
 
 	FormatEx(g_sName[client], sizeof(g_sName[]), "%N", client);
 
@@ -354,8 +464,8 @@ public void OnClientConnected(int client)
 
 	// If the authid is detected as SteamID Pending, try to get the real SteamID
 	// by skip the backend validation status. #948
-	if (strncmp(auth[6], "ID_", 3) == 0)
-		GetClientAuthId(client, AuthId_Steam2, g_sSteamIDs[client], sizeof(g_sSteamIDs[]), false);
+	// if (strncmp(auth[6], "ID_", 3) == 0)
+	//	GetClientAuthId(client, AuthId_Steam2, g_sSteamIDs[client], sizeof(g_sSteamIDs[]), false);
 
 	/* Do not check bots nor check player with lan steamid. */
 	if (auth[0] == 'B' || auth[9] == 'L' || DB == INVALID_HANDLE)
@@ -363,6 +473,8 @@ public void OnClientConnected(int client)
 		PlayerStatus[client] = true;
 		return;
 	}
+
+	OnClientAuthorized(client, g_sSteamIDs[client]);
 }
 
 public void OnClientAuthorized(int client, const char[] auth)
